@@ -69,6 +69,20 @@ pub enum PaymentError {
     EmptyBatch = 8,
 }
 
+/// Typed errors raised when deployment parameters fail validation at
+/// initialization time (issue: deployment parameter validation).
+#[contracterror]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DeploymentError {
+    /// `initialize` was called on an already-initialized contract.
+    AlreadyInitialized = 1,
+    /// Two dependency contracts were wired to the same address.
+    DuplicateDependency = 2,
+    /// A dependency address points at the payment executor itself.
+    SelfReference = 3,
+}
+
 /// Contract addresses for dependencies
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -126,12 +140,54 @@ impl PaymentExecutor {
         }
     }
 
-    /// Initialize with contract addresses
-    pub fn initialize(env: Env, addresses: ContractAddresses) {
+    /// Validate deployment wiring before any state is written.
+    ///
+    /// Dependency contracts must be distinct deployments and must not point
+    /// at the executor itself — reusing one contract ID for two roles is a
+    /// classic deploy-time copy/paste mistake that silently breaks payroll.
+    fn validate_deployment_params(
+        env: &Env,
+        addresses: &ContractAddresses,
+    ) -> Result<(), DeploymentError> {
+        let self_addr = env.current_contract_address();
+        let ContractAddresses {
+            registry,
+            commitment,
+            verifier,
+            token,
+        } = addresses;
+
+        for addr in [registry, commitment, verifier, token] {
+            if *addr == self_addr {
+                return Err(DeploymentError::SelfReference);
+            }
+        }
+
+        if registry == commitment
+            || registry == verifier
+            || registry == token
+            || commitment == verifier
+            || commitment == token
+            || verifier == token
+        {
+            return Err(DeploymentError::DuplicateDependency);
+        }
+
+        Ok(())
+    }
+
+    /// Initialize with contract addresses.
+    ///
+    /// Validates the deployment parameters before storing them: every
+    /// dependency must be a distinct address and none may point at the
+    /// executor itself. The initial payment asset (`token`) is automatically
+    /// allowlisted so the supported-asset set is never empty.
+    pub fn initialize(env: Env, addresses: ContractAddresses) -> Result<(), DeploymentError> {
         let key = DataKey::Addresses;
         if env.storage().persistent().has(&key) {
-            panic!("Already initialized");
+            return Err(DeploymentError::AlreadyInitialized);
         }
+        Self::validate_deployment_params(&env, &addresses)?;
         env.storage().persistent().set(&key, &addresses);
         // Automatically allow initial token asset (issue #175)
         env.storage()
@@ -149,6 +205,7 @@ impl PaymentExecutor {
             ),
             (true, env.ledger().timestamp()),
         );
+        Ok(())
     }
 
     /// Set the executor-level admin (one-time, protected by auth).
@@ -449,6 +506,17 @@ impl PaymentExecutor {
             .persistent()
             .set(&total_key, &(current_total + amount));
 
+        // Track per-period payment count (invariant I-8).
+        let period_key = DataKey::Period(company_id, period);
+        if let Some(mut p) = env
+            .storage()
+            .persistent()
+            .get::<_, PayrollPeriod>(&period_key)
+        {
+            p.payment_count += 1;
+            env.storage().persistent().set(&period_key, &p);
+        }
+
         // Emit PayrollProcessed event so off-chain indexers can reconcile payments.
         payroll_events::emit_executor_payment_processed(&env, company_id, employee, amount, period);
 
@@ -656,8 +724,10 @@ mod tests {
         assert_eq!(token_client.balance(&employee), 1_000);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 5);
-        let event = events.get(4).unwrap();
+        // initialize (TreasuryAssetAllowedUpdated), register_company,
+        // store_commitment, add_employee, create_period, execute_payment.
+        assert_eq!(events.len(), 6);
+        let event = events.get(5).unwrap();
         assert_eq!(event.1.len(), 2);
         let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
         assert_eq!(sym0, Symbol::new(&env, "PayrollProcessed"));
@@ -968,8 +1038,8 @@ mod tests {
         assert_eq!(client.get_total_paid(&company_id), 2_500);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 5);
-        let event = events.get(4).unwrap();
+        assert_eq!(events.len(), 6);
+        let event = events.get(5).unwrap();
         assert_eq!(event.1.len(), 2);
         let sym: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
         assert_eq!(sym, Symbol::new(&env, "PayrollProcessed"));

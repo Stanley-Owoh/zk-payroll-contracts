@@ -22,23 +22,16 @@
 //! assert_post_migration_invariants(&env, &ctx);
 //! ```
 
-use audit_module::{AuditModule, AuditModuleClient, AuditScope, ViewKeyRecord};
+use audit_module::{AuditModule, AuditModuleClient};
 use pause_manager::{PauseManager, PauseManagerClient};
 use payment_executor::{
     ContractAddresses as ExecutorContractAddresses, PaymentExecutor, PaymentExecutorClient,
 };
-use payroll::{
-    ContractAddresses as PayrollContractAddresses, Payroll, PayrollClient, PayrollRun,
-    ReconciliationStatus,
-};
-use payroll_registry::{
-    CompanyInfo, EmployeeStatus, PayrollRegistry, PayrollRegistryClient, PendingCompanyRotation,
-};
+use payroll::{Payroll, PayrollClient, ReconciliationStatus};
+use payroll_registry::{EmployeeStatus, PayrollRegistry, PayrollRegistryClient};
 use proof_verifier::{ProofVerifier, ProofVerifierClient, VerificationKey};
-use salary_commitment::{
-    SalaryCommitment, SalaryCommitmentContract, SalaryCommitmentContractClient,
-};
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, IntoVal, Symbol, Vec};
+use salary_commitment::{SalaryCommitmentContract, SalaryCommitmentContractClient};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec};
 use token::{Token, TokenClient};
 
 use crate::state_fixtures;
@@ -212,14 +205,19 @@ impl MigrationContext {
             &self.treasury_owner,
         );
 
-        // Initialize audit module
-        let audit_client = AuditModuleClient::new(env, &self.audit_id);
-        audit_client.initialize(&self.admin);
+        // Note: audit_module has no admin-init entrypoint; its view-key
+        // granter is the contract's own address and state begins empty.
     }
 
     /// Write full v1 state: companies, employees, payroll runs, audit permissions, etc.
     pub fn write_full_v1_state(&mut self, env: &Env) {
         env.mock_all_auths();
+
+        // Give the simulated chain a deterministic non-zero time so records
+        // that carry timestamps (payroll runs, emergency requests) hold
+        // realistic values.
+        use soroban_sdk::testutils::Ledger as _;
+        env.ledger().set_timestamp(1_700_000_000);
 
         // ── Companies ────────────────────────────────────────────────────
         let registry_client = PayrollRegistryClient::new(env, &self.registry_id);
@@ -260,9 +258,12 @@ impl MigrationContext {
         );
 
         // ── Commitment history for Alice (simulate rotation) ─────────────
-        let old_commitment = state_fixtures::seed_bytes32(env, 0xAA);
+        let _old_commitment = state_fixtures::seed_bytes32(env, 0xAA);
         let new_commitment = state_fixtures::seed_bytes32(env, 0xBB);
         commitment_client.update_commitment(&self.alice, &new_commitment);
+        // Keep the registry's copy of the active commitment in sync with the
+        // rotated commitment stored in the commitment contract.
+        registry_client.update_commitment(&self.company_id_1, &self.alice, &new_commitment);
         self.has_commitment_history = true;
 
         // ── Nullifiers ───────────────────────────────────────────────────
@@ -273,7 +274,7 @@ impl MigrationContext {
         self.has_nullifiers = true;
 
         // ── Payroll runs ─────────────────────────────────────────────────
-        let payroll_client = PayrollClient::new(env, &self.payroll_id);
+        let _payroll_client = PayrollClient::new(env, &self.payroll_id);
 
         // Historical run 1: Reconciled
         // We directly write to simulate pre-existing runs with specific statuses
@@ -401,18 +402,26 @@ impl MigrationContext {
         // 3. Write new-format keys (e.g., DataKey::CompanyV2(u64))
         // 4. Optionally remove old keys after migration window
 
-        // For now, assert that pre-upgrade data is still accessible.
-        let registry_client = PayrollRegistryClient::new(env, &self.registry_id);
-        let _company1 = registry_client.get_company(&self.company_id_1);
-        let _company2 = registry_client.get_company(&self.company_id_2);
+        // For now, assert that pre-upgrade data is still accessible. Each
+        // block is gated on the corresponding state flag so reduced setups
+        // (which populate only part of the state) still work.
+        if self.has_companies {
+            let registry_client = PayrollRegistryClient::new(env, &self.registry_id);
+            let _company1 = registry_client.get_company(&self.company_id_1);
+            let _company2 = registry_client.get_company(&self.company_id_2);
+        }
 
-        let commitment_client = SalaryCommitmentContractClient::new(env, &self.commitment_id);
-        assert!(commitment_client.has_commitment(&self.alice));
-        assert!(commitment_client.has_commitment(&self.bob));
+        if self.has_employees {
+            let commitment_client = SalaryCommitmentContractClient::new(env, &self.commitment_id);
+            assert!(commitment_client.has_commitment(&self.alice));
+            assert!(commitment_client.has_commitment(&self.bob));
+        }
 
-        let payroll_client = PayrollClient::new(env, &self.payroll_id);
-        let _run1 = payroll_client.get_payroll_run(&self.run_id_1);
-        let _run2 = payroll_client.get_payroll_run(&self.run_id_2);
+        if self.has_payroll_runs {
+            let payroll_client = PayrollClient::new(env, &self.payroll_id);
+            let _run1 = payroll_client.get_payroll_run(&self.run_id_1);
+            let _run2 = payroll_client.get_payroll_run(&self.run_id_2);
+        }
     }
 }
 
