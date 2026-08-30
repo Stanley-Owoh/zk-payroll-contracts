@@ -85,6 +85,7 @@ fn setup_system<'a>(
 
     let commitment_admin = Address::generate(env);
     commitment_client.init_commitment_admin(&commitment_admin);
+    commitment_client.set_payroll_operator(&executor_id);
 
     let admin = Address::generate(env);
     let treasury = Address::generate(env);
@@ -230,6 +231,23 @@ fn test_batch_failure_reverts_fully_and_individual_payments_recover() {
         "emp3 must be recoverable individually"
     );
     assert_eq!(executor.get_total_paid(&company_id), 100 + 300 + 200);
+    // Batch execution returned an error — frame reverted cleanly.
+    assert!(
+        !executor.is_paid(&emp1, &1),
+        "emp1 remains unpaid after batch rollback"
+    );
+    assert!(
+        !executor.is_paid(&emp3, &1),
+        "emp3 remains unpaid after batch rollback"
+    );
+    assert_eq!(executor.get_total_paid(&company_id), 300);
+
+    // Recovery: pay emp1 and emp3 individually in period 1.
+    executor.execute_payment(&company_id, &emp1, &100, &pa1, &pb1, &pc1, &null1, &1);
+    executor.execute_payment(&company_id, &emp3, &200, &pa3, &pb3, &pc3, &null3, &1);
+    assert!(executor.is_paid(&emp1, &1));
+    assert!(executor.is_paid(&emp3, &1));
+    assert_eq!(executor.get_total_paid(&company_id), 300 + 100 + 200);
 }
 
 // ===========================================================================
@@ -571,18 +589,31 @@ fn test_partial_batch_failure_individual_retry_completes_payroll() {
     assert!(
         !executor.is_paid(&emp3, &1),
         "emp3 must be unpaid after batch failure"
+    // Batch execution returned an error — frame reverted cleanly.
+    assert!(
+        !executor.is_paid(&emp1, &1),
+        "emp1 remains unpaid after batch rollback"
+    );
+    assert!(
+        !executor.is_paid(&emp3, &1),
+        "emp3 remains unpaid after batch rollback"
     );
     // Only the pre-paid emp2 amount survives.
     assert_eq!(executor.get_total_paid(&company_id), 400);
 
     // Recovery: pay the missed employees individually in the same open period.
+    // Recovery: pay emp1 and emp3 individually in the same open period.
     executor.execute_payment(&company_id, &emp1, &100, &pa1, &pb1, &pc1, &null1, &1);
     executor.execute_payment(&company_id, &emp3, &200, &pa3, &pb3, &pc3, &null3, &1);
+    assert!(
+        executor.is_paid(&emp1, &1),
+        "emp1 must succeed after individual recovery"
+    );
     assert!(
         executor.is_paid(&emp3, &1),
         "emp3 must succeed after individual recovery"
     );
-    assert_eq!(executor.get_total_paid(&company_id), 100 + 400 + 200);
+    assert_eq!(executor.get_total_paid(&company_id), 400 + 100 + 200);
 }
 
 // ===========================================================================

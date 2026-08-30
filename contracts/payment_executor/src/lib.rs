@@ -446,8 +446,9 @@ impl PaymentExecutor {
         let registry = PayrollRegistryClient::new(&env, &addresses.registry);
         let company: CompanyInfo = registry.get_company(&company_id);
 
-        // Ensure only HR admin for this company can trigger payroll.
+        // Ensure only HR admin for this company can trigger payroll and treasury authorizes payment.
         company.admin.require_auth();
+        company.treasury.require_auth();
 
         // Construct public inputs required by issue #20:
         let mut public_inputs = soroban_sdk::Vec::new(&env);
@@ -498,6 +499,17 @@ impl PaymentExecutor {
 
         env.storage().persistent().set(&payment_key, &record);
         env.storage().persistent().set(&nullifier_key, &true);
+
+        // Increment period payment count
+        let period_key = DataKey::Period(company_id, period);
+        if let Some(mut period_struct) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PayrollPeriod>(&period_key)
+        {
+            period_struct.payment_count += 1;
+            env.storage().persistent().set(&period_key, &period_struct);
+        }
 
         // Update total paid
         let total_key = DataKey::TotalPaid(company_id);
@@ -597,6 +609,30 @@ impl PaymentExecutor {
     /// Get the maximum allowed age for a proof in seconds (issue #77).
     pub fn get_max_proof_age(_env: Env) -> u64 {
         MAX_PROOF_AGE_SECONDS
+    }
+
+    /// Get the contract dependency addresses configured during initialization.
+    pub fn get_addresses(env: Env) -> ContractAddresses {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized")
+    }
+
+    /// Get the executor admin address.
+    pub fn get_executor_admin(env: Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExecutorAdmin)
+            .expect("Executor admin not set")
+    }
+
+    /// Get the current period sequence for a company (defaults to 0).
+    pub fn get_period_sequence(env: Env, company_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PeriodSequence(company_id))
+            .unwrap_or(0u32)
     }
 }
 
@@ -728,6 +764,8 @@ mod tests {
         // store_commitment, add_employee, create_period, execute_payment.
         assert_eq!(events.len(), 6);
         let event = events.get(5).unwrap();
+        assert_eq!(events.len(), 6);
+        let event = events.get(events.len() - 1).unwrap();
         assert_eq!(event.1.len(), 2);
         let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
         assert_eq!(sym0, Symbol::new(&env, "PayrollProcessed"));
@@ -1040,6 +1078,7 @@ mod tests {
         let events = env.events().all();
         assert_eq!(events.len(), 6);
         let event = events.get(5).unwrap();
+        let event = events.get(events.len() - 1).unwrap();
         assert_eq!(event.1.len(), 2);
         let sym: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
         assert_eq!(sym, Symbol::new(&env, "PayrollProcessed"));
@@ -1601,5 +1640,87 @@ mod tests {
             &nullifier,
             &1u32,
         );
+    }
+
+    // =====================================================================
+    // Issue #277: `amount_to_public_input` precision-format encoding
+    //
+    // The ZK public input for an amount must be a canonical, big-endian,
+    // zero-padded `BytesN<32>` per
+    // `docs/interop/proof-schema-version-negotiation.md`'s "Unsupported
+    // Combinations" section ("Public inputs using i128 raw bytes instead of
+    // the canonical BytesN<32> big-endian zero-padded encoding" is
+    // explicitly rejected). These tests pin the exact byte layout across
+    // supported precision boundaries and confirm invalid (negative) amounts
+    // are rejected before any encoding happens.
+    // =====================================================================
+
+    #[test]
+    fn test_amount_to_public_input_zero_is_all_zero_bytes() {
+        let env = Env::default();
+        let encoded = PaymentExecutor::amount_to_public_input(&env, 0);
+        assert_eq!(encoded.to_array(), [0u8; 32]);
+    }
+
+    #[test]
+    fn test_amount_to_public_input_one_is_zero_padded_big_endian() {
+        let env = Env::default();
+        let encoded = PaymentExecutor::amount_to_public_input(&env, 1);
+        let arr = encoded.to_array();
+
+        // High 16 bytes are always zero: i128 fits entirely within the low
+        // 16 bytes of the 32-byte field, per the canonical encoding.
+        assert_eq!(arr[..16], [0u8; 16]);
+        // Big-endian: the least-significant byte is last.
+        let mut expected_low16 = [0u8; 16];
+        expected_low16[15] = 1;
+        assert_eq!(arr[16..], expected_low16);
+    }
+
+    #[test]
+    fn test_amount_to_public_input_preserves_full_precision_for_non_round_amount() {
+        // A non-round, multi-byte amount must round-trip through the
+        // big-endian encoding with no truncation or rounding drift.
+        let env = Env::default();
+        let amount: i128 = 999_999_999_937;
+        let encoded = PaymentExecutor::amount_to_public_input(&env, amount);
+        let arr = encoded.to_array();
+
+        let mut low16 = [0u8; 16];
+        low16.copy_from_slice(&arr[16..]);
+        let round_tripped = u128::from_be_bytes(low16) as i128;
+
+        assert_eq!(arr[..16], [0u8; 16]);
+        assert_eq!(round_tripped, amount);
+    }
+
+    #[test]
+    fn test_amount_to_public_input_accepts_maximum_i128_at_full_precision() {
+        let env = Env::default();
+        let encoded = PaymentExecutor::amount_to_public_input(&env, i128::MAX);
+        let arr = encoded.to_array();
+
+        let mut low16 = [0u8; 16];
+        low16.copy_from_slice(&arr[16..]);
+        let round_tripped = u128::from_be_bytes(low16) as i128;
+
+        assert_eq!(round_tripped, i128::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "Amount must be non-negative")]
+    fn test_amount_to_public_input_rejects_negative_one() {
+        // Boundary just below the supported precision range: the smallest
+        // magnitude negative value must still be rejected, not just
+        // `i128::MIN`.
+        let env = Env::default();
+        let _ = PaymentExecutor::amount_to_public_input(&env, -1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Amount must be non-negative")]
+    fn test_amount_to_public_input_rejects_i128_min() {
+        let env = Env::default();
+        let _ = PaymentExecutor::amount_to_public_input(&env, i128::MIN);
     }
 }

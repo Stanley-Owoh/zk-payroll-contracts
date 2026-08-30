@@ -22,7 +22,7 @@
 //! - `mg_flow_*` — Active flow continuation tests
 
 #[cfg(test)]
-#[allow(clippy::module_inception)]
+#[allow(clippy::module_inception, unused_imports, unused_variables)]
 mod migration_tests {
     use audit_module::AuditModuleClient;
     use payment_executor::PaymentExecutorClient;
@@ -198,6 +198,7 @@ mod migration_tests {
             ctx.company_id_2 + 1,
             "New company ID must be sequential"
         );
+        assert_eq!(new_company_id, 2, "New company ID must be sequential");
         let new_company = registry_client.get_company(&new_company_id);
         assert_eq!(new_company.admin, new_admin);
         assert_eq!(new_company.treasury, new_treasury);
@@ -460,6 +461,10 @@ mod migration_tests {
         // period is closed (the executor refuses a new period while the
         // previous one for the same company remains open).
         executor_client.close_period(&ctx.company_id_2, &1);
+        // Close open period so a new period can be created
+        let _ = executor_client.close_period(&ctx.company_id_2, &1);
+
+        // New periods can be created post-migration
         let new_p = executor_client.create_period(&ctx.company_id_2);
         assert_eq!(new_p.period_id, 2, "Period sequence must continue");
         assert_eq!(new_p.company_id, ctx.company_id_2);

@@ -17,10 +17,7 @@
 //!
 //! let mut ctx = setup_full_v1_state(&env);
 //! // Apply upgrade / migration function
-//! ctx.simulate_upgrade_v2();
-//! // Assert all state is preserved
-//! assert_post_migration_invariants(&env, &ctx);
-//! ```
+#![allow(unused_imports, unused_variables)]
 
 use audit_module::{AuditModule, AuditModuleClient};
 use pause_manager::{PauseManager, PauseManagerClient};
@@ -32,6 +29,7 @@ use payroll_registry::{EmployeeStatus, PayrollRegistry, PayrollRegistryClient};
 use proof_verifier::{ProofVerifier, ProofVerifierClient, VerificationKey};
 use salary_commitment::{SalaryCommitmentContract, SalaryCommitmentContractClient};
 use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env, Vec};
 use token::{Token, TokenClient};
 
 use crate::state_fixtures;
@@ -167,7 +165,7 @@ impl MigrationContext {
         // Initialize commitment contract admin
         let commitment_client = SalaryCommitmentContractClient::new(env, &self.commitment_id);
         commitment_client.init_commitment_admin(&self.admin);
-        commitment_client.set_payroll_operator(&self.payroll_operator);
+        commitment_client.set_payroll_operator(&self.payroll_id);
 
         // Initialize token & mint to treasury
         let token_client = TokenClient::new(env, &self.token_id);
@@ -207,11 +205,14 @@ impl MigrationContext {
 
         // Note: audit_module has no admin-init entrypoint; its view-key
         // granter is the contract's own address and state begins empty.
+        // Initialize audit module
+        let _audit_client = AuditModuleClient::new(env, &self.audit_id);
     }
 
     /// Write full v1 state: companies, employees, payroll runs, audit permissions, etc.
     pub fn write_full_v1_state(&mut self, env: &Env) {
         env.mock_all_auths();
+        env.ledger().set_timestamp(1_700_000_000);
 
         // Give the simulated chain a deterministic non-zero time so records
         // that carry timestamps (payroll runs, emergency requests) hold
@@ -358,6 +359,7 @@ impl MigrationContext {
         // ── Mark flags ───────────────────────────────────────────────────
         self.has_companies = true;
         self.has_employees = true;
+        self.has_payroll_runs = true;
     }
 
     /// Simulate an upgrade by re-registering the v2 contract and re-initializing.
@@ -409,6 +411,13 @@ impl MigrationContext {
             let registry_client = PayrollRegistryClient::new(env, &self.registry_id);
             let _company1 = registry_client.get_company(&self.company_id_1);
             let _company2 = registry_client.get_company(&self.company_id_2);
+        // For now, assert that pre-upgrade data is still accessible.
+        if self.has_companies {
+            let registry_client = PayrollRegistryClient::new(env, &self.registry_id);
+            let _company1 = registry_client.get_company(&self.company_id_1);
+            if self.company_id_2 > 0 {
+                let _company2 = registry_client.get_company(&self.company_id_2);
+            }
         }
 
         if self.has_employees {
